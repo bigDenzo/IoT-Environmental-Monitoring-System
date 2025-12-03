@@ -1,0 +1,316 @@
+#include <Adafruit_GFX.h>
+#include <Adafruit_ILI9341.h>
+#include <Adafruit_BMP085.h>
+#include <DHT.h>
+#include <ESP8266WiFi.h>
+#include <ESPAsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+
+//Pin layout
+// VCC and GND to VCC and GND of the microcontroller
+//DHT11 - D2
+//BMP180 SDA - D2
+//BMP180 SCL - D1
+//MQ2 Analog Output - A0
+//CZN-15E - D6
+//TFT CS - D8
+//TFT DC - D3
+//TFT RESET - D4
+//TFT MOSI - D7
+//TFT SCK - D5
+//TFT LED - 3.3V
+
+
+// Pins
+#define TFT_CS   15
+#define TFT_DC   0
+#define TFT_RST  2
+#define DHTPIN   4
+#define MQ2_PIN  A0
+#define SOUND_PIN 5  // D1 (GPIO5 for CZN-15E digital out)
+
+// WiFi credentials
+const char* ssid = "Your_SSID";
+const char* password = "Your_Password";
+
+// TFT
+Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
+
+// Sensors
+Adafruit_BMP085 bmp;
+DHT dht(DHTPIN, DHT11);
+AsyncWebServer server(80);
+
+// Sensor values
+float temperature, humidity, pressure;
+float co, ch4, lpg;
+bool soundDetected = false;
+
+// Icons (8x8 bitmaps)
+const uint8_t tempIcon[8] = {
+  0b00110000, 0b01001000, 0b01001000, 0b01001000,
+  0b01001000, 0b01001000, 0b01001000, 0b00110000
+};
+const uint8_t humidityIcon[8] = {
+  0b00010000, 0b00111000, 0b01111100, 0b11111110,
+  0b11111110, 0b01111100, 0b00111000, 0b00010000
+};
+const uint8_t pressureIcon[8] = {
+  0b11111111, 0b10000001, 0b10100101, 0b10000001,
+  0b10100101, 0b10011001, 0b10000001, 0b11111111
+};
+
+// Draw 3x scale icon
+void drawIcon(const uint8_t *icon, int x, int y, uint16_t color) {
+  for (int row = 0; row < 8; row++) {
+    for (int col = 0; col < 8; col++) {
+      if (icon[row] & (0x80 >> col)) {
+        for (int dy = 0; dy < 3; dy++) {
+          for (int dx = 0; dx < 3; dx++) {
+            tft.drawPixel(x + col * 3 + dx, y + row * 3 + dy, color);
+          }
+        }
+      }
+    }
+  }
+}
+
+// Read sensors
+void updateSensorData() {
+  temperature = dht.readTemperature();
+  humidity = dht.readHumidity();
+  pressure = bmp.readPressure() / 100.0;
+  int mqValue = analogRead(MQ2_PIN);
+  co = map(mqValue, 0, 1023, 0, 100);
+  ch4 = map(mqValue, 0, 1023, 0, 100);
+  lpg = map(mqValue, 0, 1023, 0, 100);
+  soundDetected = digitalRead(SOUND_PIN) == HIGH;
+}
+
+// TFT Display helpers
+void showCenteredText(String label, String value, const uint8_t *icon, uint16_t color) {
+  tft.fillScreen(ILI9341_BLACK);
+  drawIcon(icon, 10, 10, color);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.setTextSize(3);
+  int16_t x1, y1;
+  uint16_t w, h;
+  tft.getTextBounds(label, 0, 0, &x1, &y1, &w, &h);
+  tft.setCursor((240 - w) / 2, 10);
+  tft.print(label);
+  tft.getTextBounds(value, 0, 0, &x1, &y1, &w, &h);
+  tft.setCursor((240 - w) / 2, 50);
+  tft.print(value);
+}
+
+void showSummary() {
+  tft.fillScreen(ILI9341_BLACK);
+  tft.setTextColor(ILI9341_GREEN);
+  tft.setTextSize(2);
+  tft.setCursor(10, 10);
+  tft.print("Temperature: "); tft.print(temperature, 1); tft.println(" C");
+  tft.setCursor(10, 40);
+  tft.print("Humidity: "); tft.print(humidity, 1); tft.println(" %");
+  tft.setCursor(10, 70);
+  tft.print("Pressure: "); tft.print(pressure, 1); tft.println(" hPa");
+  tft.setCursor(10, 100);
+  tft.print("LPG: "); tft.print(lpg, 0); tft.println(" %");
+  tft.setCursor(10, 130);
+  tft.print("CO: "); tft.print(co, 0); tft.println(" %");
+  tft.setCursor(10, 160);
+  tft.print("CH4: "); tft.print(ch4, 0); tft.println(" %");
+  tft.setCursor(10, 190);
+  tft.print("Sound: ");
+  tft.setTextColor(soundDetected ? ILI9341_RED : ILI9341_WHITE);
+  tft.print(soundDetected ? "YES" : "NO");
+
+  // Show IP Address
+  tft.setTextColor(ILI9341_CYAN);
+  tft.setCursor(10, 220);  // Add below the last line
+  tft.setTextSize(1);
+  tft.print("IP: ");
+  tft.println(WiFi.localIP());
+}
+
+
+// WiFi
+void setupWiFi() {
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nConnected. IP: " + WiFi.localIP().toString());
+}
+
+// Web Server
+void setupServer() {
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *req) {
+    req->send_P(200, "text/html", R"rawliteral(
+<!DOCTYPE html><html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESP8266 Monitor</title>
+<style>
+  body {
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    background: #0b0f1a;
+    color: #eee;
+    padding: 20px;
+    margin: 0;
+  }
+
+  h2 {
+    text-align: center;
+    color: #4af;
+    font-weight: 600;
+    margin-bottom: 30px;
+  }
+
+  .container {
+    max-width: 500px;
+    margin: auto;
+  }
+
+  .sensor {
+    margin-bottom: 24px;
+    padding: 10px 15px;
+    background: #1a1f2c;
+    border: 1px solid #333;
+    border-radius: 12px;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+  }
+
+  .sensor b {
+    font-size: 1.1em;
+  }
+
+  .sensor span {
+    float: right;
+    font-weight: bold;
+    color: #fff;
+  }
+
+  .bar-wrap {
+    background: #2c2f3a;
+    border-radius: 20px;
+    height: 30px;
+    overflow: hidden;
+    margin-top: 10px;
+  }
+
+  .bar {
+    height: 100%;
+    border-radius: 20px;
+    transition: width 0.5s ease-in-out;
+  }
+
+  .temp     { background: #f44; }
+  .humidity { background: #38f; }
+  .pressure { background: #fc0; }
+  .co       { background: #f0f; }
+  .ch4      { background: #a0f; }
+  .lpg      { background: #0f5; }
+  .sound    { background: #0ff; }
+</style>
+
+
+<script>
+function update() {
+  fetch("/data").then(res => res.json()).then(d => {
+    for (const k in d) {
+      document.getElementById(k).innerText = d[k].value;
+      document.getElementById(k + "_bar").style.width = d[k].level + "%";
+    }
+  });
+}
+setInterval(update, 3000); window.onload = update;
+</script>
+</head>
+<body>
+  <div class="container">
+    <h2>ESP8266 Live Monitor</h2>
+
+    <div class="sensor">
+      <b>Temperature:</b> <span id="temp">--</span> °C
+      <div class="bar-wrap"><div class="bar temp" id="temp_bar"></div></div>
+    </div>
+
+    <div class="sensor">
+      <b>Humidity:</b> <span id="humidity">--</span> %
+      <div class="bar-wrap"><div class="bar humidity" id="humidity_bar"></div></div>
+    </div>
+
+    <div class="sensor">
+      <b>Pressure:</b> <span id="pressure">--</span> hPa
+      <div class="bar-wrap"><div class="bar pressure" id="pressure_bar"></div></div>
+    </div>
+
+    <div class="sensor">
+      <b>LPG:</b> <span id="lpg">--</span> %
+      <div class="bar-wrap"><div class="bar lpg" id="lpg_bar"></div></div>
+    </div>
+
+    <div class="sensor">
+      <b>CO:</b> <span id="co">--</span> %
+      <div class="bar-wrap"><div class="bar co" id="co_bar"></div></div>
+    </div>
+
+    <div class="sensor">
+      <b>CH4:</b> <span id="ch4">--</span> %
+      <div class="bar-wrap"><div class="bar ch4" id="ch4_bar"></div></div>
+    </div>
+
+    <div class="sensor">
+      <b>Sound:</b> <span id="sound">--</span>
+      <div class="bar-wrap"><div class="bar sound" id="sound_bar"></div></div>
+    </div>
+  </div>
+</body>
+
+
+</html>
+)rawliteral");
+  });
+
+  server.on("/data", HTTP_GET, [](AsyncWebServerRequest *req) {
+    String json = "{";
+    json += "\"temp\":{\"value\":\"" + String(temperature, 1) + "\",\"level\":" + String(min(100, (int)temperature * 3)) + "},";
+    json += "\"humidity\":{\"value\":\"" + String(humidity, 1) + "\",\"level\":" + String((int)humidity) + "},";
+    json += "\"pressure\":{\"value\":\"" + String(pressure, 1) + "\",\"level\":" + String((int)((pressure - 900) * 0.8)) + "},";
+    json += "\"lpg\":{\"value\":\"" + String((int)lpg) + "\",\"level\":" + String((int)lpg) + "},";
+    json += "\"co\":{\"value\":\"" + String((int)co) + "\",\"level\":" + String((int)co) + "},";
+    json += "\"ch4\":{\"value\":\"" + String((int)ch4) + "\",\"level\":" + String((int)ch4) + "},";
+    json += "\"sound\":{\"value\":\"" + String(soundDetected ? "YES" : "NO") + "\",\"level\":" + String(soundDetected ? 100 : 0) + "}";
+    json += "}";
+    req->send(200, "application/json", json);
+  });
+
+  server.begin();
+}
+
+// SETUP
+void setup() {
+  Serial.begin(115200);
+  pinMode(SOUND_PIN, INPUT);
+  dht.begin();
+  bmp.begin();
+  tft.begin();
+  tft.setRotation(1);
+  setupWiFi();
+  setupServer();
+}
+
+// LOOP
+void loop() {
+  updateSensorData();
+  showCenteredText("Temperature", String(temperature, 1) + " C", tempIcon, ILI9341_RED);
+  delay(3000);
+  showCenteredText("Humidity", String(humidity, 1) + " %", humidityIcon, ILI9341_CYAN);
+  delay(3000);
+  showCenteredText("Pressure", String(pressure, 1) + " hPa", pressureIcon, ILI9341_YELLOW);
+  delay(3000);
+  showSummary();
+  delay(8000);
+}
